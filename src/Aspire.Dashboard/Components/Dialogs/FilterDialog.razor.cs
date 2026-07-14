@@ -15,10 +15,19 @@ namespace Aspire.Dashboard.Components.Dialogs;
 
 public partial class FilterDialog : IAsyncDisposable
 {
+    private readonly CancellationTokenSource _cts;
+    private readonly CancellationToken _cancellationToken;
+    private CancellationTokenSource? _fieldValuesCts;
     private List<SelectViewModel<FilterCondition>> _filterConditions = null!;
     private List<SelectViewModel<FilterCondition>> _stringFilterConditions = null!;
     private List<SelectViewModel<FilterCondition>> _numericFilterConditions = null!;
     private List<SelectViewModel<FilterCondition>> _dateFilterConditions = null!;
+
+    public FilterDialog()
+    {
+        _cts = new();
+        _cancellationToken = _cts.Token;
+    }
 
     private SelectViewModel<FilterCondition> CreateFilterSelectViewModel(FilterCondition condition) =>
         new SelectViewModel<FilterCondition> { Id = condition, Name = FieldTelemetryFilter.ConditionToString(condition, FilterLoc) };
@@ -30,7 +39,9 @@ public partial class FilterDialog : IAsyncDisposable
     public FilterDialogViewModel Content { get; set; } = default!;
 
     [Inject]
-    public required TelemetryRepository TelemetryRepository { get; init; }
+    public required DashboardDataSource DataSource { get; init; }
+
+    public ITelemetryRepository TelemetryRepository => DataSource.TelemetryRepository;
 
     [Inject]
     public required IJSRuntime JS { get; init; }
@@ -41,10 +52,12 @@ public partial class FilterDialog : IAsyncDisposable
     private List<SelectViewModel<string>> _parameters = default!;
     private List<SelectViewModel<FieldValue>> _filteredValues = default!;
     private List<SelectViewModel<FieldValue>>? _allValues;
+    private bool _loadingPropertyKeys = true;
+    private bool _loadingFieldValues = true;
 
     public EditContext EditContext { get; private set; } = default!;
 
-    protected override void OnInitialized()
+    protected override async Task OnInitializedAsync()
     {
         _stringFilterConditions =
         [
@@ -80,26 +93,7 @@ public partial class FilterDialog : IAsyncDisposable
         EditContext = new EditContext(_formModel);
 
         _filteredValues = [];
-    }
-
-    protected override void OnParametersSet()
-    {
-        var knownFields = Content.KnownKeys.Select(p => new SelectViewModel<string> { Id = p, Name = FieldTelemetryFilter.ResolveFieldName(p) }).ToList();
-        var customFields = Content.PropertyKeys.Select(p => new SelectViewModel<string> { Id = p, Name = FieldTelemetryFilter.ResolveFieldName(p) }).ToList();
-
-        if (customFields.Count > 0)
-        {
-            _parameters =
-            [
-                .. knownFields,
-                new SelectViewModel<string> { Id = null, Name = "-" },
-                .. customFields
-            ];
-        }
-        else
-        {
-            _parameters = knownFields;
-        }
+        _parameters = CreateParameters([]);
 
         if (Content.Filter is { } filter)
         {
@@ -116,8 +110,46 @@ public partial class FilterDialog : IAsyncDisposable
             SetFormValue("");
         }
 
-        UpdateParameterFieldValues();
+        if (!await UpdateParameterFieldValuesAsync())
+        {
+            return;
+        }
         ValueChanged();
+
+        List<string> propertyKeys;
+        try
+        {
+            propertyKeys = await Content.GetPropertyKeysAsync(_cancellationToken);
+        }
+        catch (OperationCanceledException) when (_cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        var selectedParameter = _formModel.Parameter?.Id;
+        _parameters = CreateParameters(propertyKeys);
+        _formModel.Parameter = _parameters.SingleOrDefault(parameter => parameter.Id == selectedParameter) ?? _parameters.FirstOrDefault();
+        _loadingPropertyKeys = false;
+    }
+
+    private List<SelectViewModel<string>> CreateParameters(List<string> propertyKeys)
+    {
+        var knownFields = Content.KnownKeys.Select(p => new SelectViewModel<string> { Id = p, Name = FieldTelemetryFilter.ResolveFieldName(p) }).ToList();
+        var customFields = propertyKeys
+            .Append(Content.Filter is { Field: { } field } && !Content.KnownKeys.Contains(field, StringComparers.OtlpAttribute) ? field : null)
+            .OfType<string>()
+            .Distinct(StringComparers.OtlpAttribute)
+            .Select(propertyKey => new SelectViewModel<string> { Id = propertyKey, Name = FieldTelemetryFilter.ResolveFieldName(propertyKey) })
+            .ToList();
+
+        return customFields.Count > 0
+            ?
+            [
+                .. knownFields,
+                new SelectViewModel<string> { Id = null, Name = "-" },
+                .. customFields
+            ]
+            : knownFields;
     }
 
     private void UpdateSelectedParameter()
@@ -155,29 +187,61 @@ public partial class FilterDialog : IAsyncDisposable
         }
     }
 
-    private void UpdateParameterFieldValues()
+    private async Task<bool> UpdateParameterFieldValuesAsync()
     {
+        _fieldValuesCts?.Cancel();
+
         if (_formModel.ValueIsNumeric || _formModel.ValueIsDate)
         {
             _allValues = null;
             _filteredValues = [];
-            return;
+            _loadingFieldValues = false;
+            return true;
         }
 
         if (_formModel.Parameter?.Id is { } parameterName)
         {
-            var fieldValues = Content.GetFieldValues(parameterName);
-            _allValues = fieldValues
-                .Select(kvp => new FieldValue { Value = kvp.Key, Count = kvp.Value })
-                .OrderByDescending(v => v.Count)
-                .ThenBy(v => v.Value, StringComparers.OtlpFieldValue)
-                .Select(v => new SelectViewModel<FieldValue> { Id = v, Name = v.Value })
-                .ToList();
+            var fieldValuesCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+            var fieldValuesCancellationToken = fieldValuesCts.Token;
+            _fieldValuesCts = fieldValuesCts;
+            _loadingFieldValues = true;
+            _allValues = null;
+            _filteredValues = [];
+
+            try
+            {
+                var fieldValues = await Content.GetFieldValuesAsync(parameterName, fieldValuesCancellationToken);
+                fieldValuesCancellationToken.ThrowIfCancellationRequested();
+
+                _allValues = fieldValues
+                    .Select(kvp => new FieldValue { Value = kvp.Key, Count = kvp.Value })
+                    .OrderByDescending(v => v.Count)
+                    .ThenBy(v => v.Value, StringComparers.OtlpFieldValue)
+                    .Select(v => new SelectViewModel<FieldValue> { Id = v, Name = v.Value })
+                    .ToList();
+            }
+            catch (OperationCanceledException) when (fieldValuesCancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+            finally
+            {
+                if (ReferenceEquals(_fieldValuesCts, fieldValuesCts))
+                {
+                    _fieldValuesCts = null;
+                    _loadingFieldValues = false;
+                }
+
+                fieldValuesCts.Dispose();
+            }
         }
         else
         {
             _allValues = null;
+            _loadingFieldValues = false;
         }
+
+        return true;
     }
 
     private async Task ParameterChangedAsync()
@@ -185,7 +249,10 @@ public partial class FilterDialog : IAsyncDisposable
         UpdateSelectedParameter();
         _formModel.Condition = GetDefaultCondition();
         SetFormValue("");
-        UpdateParameterFieldValues();
+        if (!await UpdateParameterFieldValuesAsync())
+        {
+            return;
+        }
 
         StateHasChanged();
 
@@ -310,6 +377,8 @@ public partial class FilterDialog : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _cts.Cancel();
+        _cts.Dispose();
         await JSInteropHelpers.SafeDisposeAsync(_jsModule);
     }
 

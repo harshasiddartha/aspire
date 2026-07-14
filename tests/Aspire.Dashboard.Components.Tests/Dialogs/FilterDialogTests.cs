@@ -58,6 +58,8 @@ public class FilterDialogTests : DashboardTestContext
 
         Assert.Empty(cut.FindComponents<FluentNumberField<double?>>());
         Assert.Contains("fluent-combobox", cut.Markup);
+        Assert.Equal(3, cut.FindAll(".filter-input-container > label").Count);
+        Assert.Empty(cut.FindAll(".input-line-container label"));
 
         var conditionSelect = Assert.Single(cut.FindComponents<FluentSelect<SelectViewModel<FilterCondition>>>());
         Assert.Collection(conditionSelect.Instance.Items!,
@@ -65,6 +67,121 @@ public class FilterDialogTests : DashboardTestContext
             item => Assert.Equal(FilterCondition.Contains, item.Id),
             item => Assert.Equal(FilterCondition.NotEqual, item.Id),
             item => Assert.Equal(FilterCondition.NotContains, item.Id));
+    }
+
+    [Fact]
+    public async Task Render_PropertyKeysLoading_DisablesParameterSelectAndDisplaysProgressRing()
+    {
+        SetupFilterDialogServices();
+        var loadingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var propertyKeys = new TaskCompletionSource<List<string>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var content = CreateContent(new FieldTelemetryFilter
+        {
+            Field = KnownTraceFields.NameField,
+            Condition = FilterCondition.Contains,
+            Value = "request"
+        });
+        content = new FilterDialogViewModel
+        {
+            Filter = content.Filter,
+            KnownKeys = content.KnownKeys,
+            GetPropertyKeysAsync = cancellationToken =>
+            {
+                loadingStarted.SetResult();
+                return propertyKeys.Task.WaitAsync(cancellationToken);
+            },
+            GetFieldValuesAsync = content.GetFieldValuesAsync
+        };
+
+        var cut = RenderComponent<FilterDialog>(builder => builder.Add(p => p.Content, content));
+        await loadingStarted.Task.WaitAsync(DefaultWaitTimeout);
+
+        Assert.True(cut.FindComponent<FluentSelect<SelectViewModel<string>>>().Instance.Disabled);
+        Assert.Single(cut.FindComponents<FluentProgressRing>());
+        Assert.NotNull(cut.Find(".input-line-container .input-progress"));
+
+        propertyKeys.SetResult(["custom.attribute"]);
+
+        cut.WaitForAssertion(() =>
+        {
+            var parameterSelect = cut.FindComponent<FluentSelect<SelectViewModel<string>>>();
+            Assert.False(parameterSelect.Instance.Disabled);
+            Assert.Empty(cut.FindComponents<FluentProgressRing>());
+            Assert.Contains(parameterSelect.Instance.Items!, item => item.Id == "custom.attribute");
+        });
+    }
+
+    [Fact]
+    public async Task Render_FieldValuesLoading_DisablesValueComboboxAndDisplaysProgressRing()
+    {
+        SetupFilterDialogServices();
+        var loadingStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fieldValues = new TaskCompletionSource<Dictionary<string, int>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var content = CreateContent(new FieldTelemetryFilter
+        {
+            Field = KnownTraceFields.NameField,
+            Condition = FilterCondition.Contains,
+            Value = "request"
+        });
+        content = new FilterDialogViewModel
+        {
+            Filter = content.Filter,
+            KnownKeys = content.KnownKeys,
+            GetPropertyKeysAsync = content.GetPropertyKeysAsync,
+            GetFieldValuesAsync = (_, cancellationToken) =>
+            {
+                loadingStarted.SetResult();
+                return fieldValues.Task.WaitAsync(cancellationToken);
+            }
+        };
+
+        var cut = RenderComponent<FilterDialog>(builder => builder.Add(p => p.Content, content));
+        await loadingStarted.Task.WaitAsync(DefaultWaitTimeout);
+
+        Assert.True(cut.Find("fluent-combobox").HasAttribute("disabled"));
+        Assert.Single(cut.FindAll("fluent-combobox + fluent-progress-ring"));
+
+        fieldValues.SetResult(new Dictionary<string, int> { ["request"] = 1 });
+
+        cut.WaitForAssertion(() =>
+        {
+            Assert.False(cut.Find("fluent-combobox").HasAttribute("disabled"));
+            Assert.Empty(cut.FindAll("fluent-combobox + fluent-progress-ring"));
+        });
+    }
+
+    [Fact]
+    public async Task Render_ChangingStringFieldAfterValuesLoad_LoadsNewValues()
+    {
+        SetupFilterDialogServices();
+        var loadedFields = new List<string>();
+        var content = new FilterDialogViewModel
+        {
+            Filter = new FieldTelemetryFilter
+            {
+                Field = KnownTraceFields.NameField,
+                Condition = FilterCondition.Contains,
+                Value = "request"
+            },
+            KnownKeys = [KnownTraceFields.NameField, KnownTraceFields.TraceIdField],
+            GetPropertyKeysAsync = static _ => Task.FromResult<List<string>>([]),
+            GetFieldValuesAsync = (field, _) =>
+            {
+                loadedFields.Add(field);
+                return Task.FromResult<Dictionary<string, int>>([]);
+            }
+        };
+
+        var cut = RenderComponent<FilterDialog>(builder => builder.Add(p => p.Content, content));
+        var parameterSelect = cut.FindComponent<FluentSelect<SelectViewModel<string>>>();
+        var traceIdOption = parameterSelect.Instance.Items!.Single(item => item.Id == KnownTraceFields.TraceIdField);
+
+        await parameterSelect.InvokeAsync(() => parameterSelect.Instance.SelectedOptionChanged.InvokeAsync(traceIdOption));
+
+        Assert.Collection(loadedFields,
+            field => Assert.Equal(KnownTraceFields.NameField, field),
+            field => Assert.Equal(KnownTraceFields.TraceIdField, field));
+        Assert.False(cut.Find("fluent-combobox").HasAttribute("disabled"));
     }
 
     private void SetupFilterDialogServices()
@@ -84,10 +201,10 @@ public class FilterDialogTests : DashboardTestContext
         {
             Filter = filter,
             KnownKeys = [KnownTraceFields.NameField, KnownTraceFields.DurationField],
-            PropertyKeys = [],
-            GetFieldValues = field => field == KnownTraceFields.NameField
+            GetPropertyKeysAsync = static _ => Task.FromResult<List<string>>([]),
+            GetFieldValuesAsync = static (field, _) => Task.FromResult(field == KnownTraceFields.NameField
                 ? new Dictionary<string, int> { ["request"] = 1 }
-                : []
+                : [])
         };
     }
 }

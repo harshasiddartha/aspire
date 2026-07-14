@@ -56,18 +56,16 @@ public class PlotlyChartTests : DashboardTestContext
         var options = new TelemetryLimitOptions();
         var logger = NullLogger.Instance;
         var context = new OtlpContext { Options = options, Logger = logger };
-        var instrument = new OtlpInstrument
+        var resource = new OtlpResource("resource", instanceId: null, uninstrumentedPeer: false, context);
+        var instrumentSummary = new OtlpInstrumentSummary
         {
-            Summary = new OtlpInstrumentSummary
-            {
-                Name = "Name-<b>Bold</b>",
-                Unit = "Unit-<b>Bold</b>",
-                Description = "Description-<b>Bold</b>",
-                Parent = new OtlpScope("Parent-Name-<b>Bold</b>", string.Empty, []),
-                Type = OtlpInstrumentType.Sum,
-                AggregationTemporality = OtlpAggregationTemporality.Cumulative
-            },
-            Context = context
+            Name = "Name-<b>Bold</b>",
+            Unit = "Unit-<b>Bold</b>",
+            Description = "Description-<b>Bold</b>",
+            Parent = new OtlpScope("Parent-Name-<b>Bold</b>", string.Empty, []),
+            Type = OtlpInstrumentType.Sum,
+            AggregationTemporality = OtlpAggregationTemporality.Cumulative,
+            ResourceView = new OtlpResourceView(resource, Array.Empty<KeyValuePair<string, string>>())
         };
 
         var model = new InstrumentViewModel();
@@ -79,7 +77,7 @@ public class PlotlyChartTests : DashboardTestContext
             TimeUnixNano = long.MaxValue
         }, context);
 
-        await model.UpdateDataAsync(instrument.Summary, [dimension]);
+        await model.UpdateDataAsync(instrumentSummary, [dimension]);
 
         // Act
         var cut = RenderComponent<PlotlyChart>(builder =>
@@ -108,5 +106,39 @@ public class PlotlyChartTests : DashboardTestContext
                     Assert.Equal("<b>Name-&lt;b&gt;Bold&lt;/b&gt;</b><br />Unit-&lt;b&gt;Bold&lt;/b&gt;: 1<br />Time: 12:59:57 AM", trace.Tooltips[0], ignoreWhiteSpaceDifferences: true);
                 });
             });
+    }
+
+    [Fact]
+    public async Task UpdateDataAsync_SubscriptionRemovedDuringUpdate_CompletesSuccessfully()
+    {
+        var model = new InstrumentViewModel();
+        var firstSubscriptionStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var continueFirstSubscription = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondSubscriptionCalled = false;
+
+        async Task FirstSubscription()
+        {
+            firstSubscriptionStarted.SetResult();
+            await continueFirstSubscription.Task;
+        }
+
+        Task SecondSubscription()
+        {
+            secondSubscriptionCalled = true;
+            return Task.CompletedTask;
+        }
+
+        model.AddDataUpdateSubscription(FirstSubscription);
+        model.AddDataUpdateSubscription(SecondSubscription);
+
+        var updateTask = model.UpdateDataAsync(null!, []);
+        await firstSubscriptionStarted.Task;
+
+        model.RemoveDataUpdateSubscription(SecondSubscription);
+        continueFirstSubscription.SetResult();
+
+        await updateTask;
+
+        Assert.True(secondSubscriptionCalled);
     }
 }
