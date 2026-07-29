@@ -44,6 +44,9 @@ public partial class DashboardRunSelect : ComponentBase
     [Inject]
     public required IDashboardRunStore RunStore { get; init; }
 
+    [Inject]
+    public required ILogger<DashboardRunSelect> Logger { get; init; }
+
     protected override void OnParametersSet()
     {
         if (_previousSelectedRunId is not null &&
@@ -56,24 +59,55 @@ public partial class DashboardRunSelect : ComponentBase
 
     private void LoadRuns()
     {
-        var runs = RunStore.GetRuns();
+        var runs = RunStore.GetRuns().Values
+            .Select(run => new
+            {
+                Run = run,
+                run.IsPinned,
+                Text = FormatRunOption(run)
+            })
+            .OrderByDescending(item => item.Run.IsCurrent)
+            .ThenByDescending(item => item.IsPinned)
+            .ThenByDescending(item => item.Run.StartedAtUtc)
+            .ToArray();
+
         _menuItems.Clear();
-        foreach (var run in runs)
+        foreach (var item in runs)
         {
+            var run = item.Run;
             _menuItems.Add(new MenuButtonItem
             {
-                Text = FormatRunOption(run),
+                Text = item.Text,
                 Role = MenuItemRole.MenuItemRadio,
                 Checked = string.Equals(run.RunId, SelectedRunId, StringComparison.Ordinal),
                 Icon = s_checkmarkIcon,
-                OnClick = () => SelectedRunIdChanged.InvokeAsync(run.IsCurrent ? null : run.RunId)
+                OnClick = () => SelectedRunIdChanged.InvokeAsync(run.IsCurrent ? null : run.RunId),
+                SecondaryActionIcon = item.IsPinned ? new Icons.Filled.Size16.Pin() : new Icons.Regular.Size16.Pin(),
+                SecondaryActionAriaLabel = Loc[item.IsPinned ? nameof(LayoutResources.DashboardRunSelectUnpin) : nameof(LayoutResources.DashboardRunSelectPin)].Value,
+                OnSecondaryActionClick = () => SetRunPinnedAsync(run, !item.IsPinned),
+                IsSecondaryActionSelected = item.IsPinned
             });
 
-            if (run.IsCurrent && runs.Any(candidate => !candidate.IsCurrent))
+            if (run.IsCurrent && runs.Any(candidate => !candidate.Run.IsCurrent))
             {
                 _menuItems.Add(new MenuButtonItem { IsDivider = true });
             }
         }
+    }
+
+    private async Task SetRunPinnedAsync(DashboardRunDescriptor run, bool isPinned)
+    {
+        try
+        {
+            RunStore.SetRunPinned(run, isPinned);
+            LoadRuns();
+        }
+        catch (Exception exception)
+        {
+            Logger.LogError(exception, "Failed to update the pinned state of dashboard run '{RunId}'.", run.RunId);
+        }
+
+        await InvokeAsync(StateHasChanged);
     }
 
     private string FormatRunOption(DashboardRunDescriptor run)
